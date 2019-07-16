@@ -460,10 +460,10 @@ data:
         s3: {
             bucket: mlpipeline,
             keyPrefix: artifacts,
-            endpoint: minio-service.<namespace>:9000,
+            endpoint: v3io-webapi.<namespace>:9000,
             insecure: true,
             accessKeySecret: {
-                name: mlpipeline-minio-artifact,
+                name: v3io-webapi,
                 key: accesskey
             },
             secretKeySecret: {
@@ -568,8 +568,6 @@ spec:
           subPath: minio
       volumes:
       - name: data
-        persistentVolumeClaim:
-          claimName: minio-pvc
 ---
 apiVersion: apps/v1beta2
 kind: Deployment
@@ -651,6 +649,8 @@ spec:
           value: X-v3io-session-key
         - name: HTTP_AUTHORIZATION_DEFAULT_VALUE
           value: <accesskey>
+        - name: MINIO_V3IO
+          value: "1"
         image: quay.io/iguazio/ml-pipelines-frontend
         imagePullPolicy: IfNotPresent
         name: ml-pipeline-ui
@@ -762,18 +762,6 @@ spec:
       serviceAccount: argo
       serviceAccountName: argo
       terminationGracePeriodSeconds: 30
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: minio-pvc
-  namespace: <namespace>
-spec:
-  accessModes:
-  - ReadWriteOnce
-  resources:
-    requests:
-      storage: 20Gi
 ---
 # Source: mysql/templates/init-scripts-configmap.yaml
 apiVersion: v1
