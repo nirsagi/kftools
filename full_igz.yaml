@@ -453,30 +453,39 @@ apiVersion: v1
 data:
   config: |
     {
-    namespace: <namespace>,
-    executorImage: argoproj/argoexec:v2.2.0,
-    artifactRepository:
-    {
-        s3: {
-            bucket: bigdata,
-            keyPrefix: mlpipeline,
-            endpoint: v3io-webapi.<namespace>:8081,
-            insecure: true,
-            accessKeySecret: {
-                name: mlpipeline-v3io,
-                key: accesskey
-            },
-            secretKeySecret: {
-                name: mlpipeline-v3io,
-                key: secretkey
-            }
-        }
-    }
+      namespace: <namespace>,
+      executorImage: argoproj/argoexec:v2.2.0,
+      artifactRepository:
+      {
+          s3: {
+              bucket: bigdata,
+              keyPrefix: mlpipeline,
+              endpoint: v3io-webapi.<namespace>:8081,
+              insecure: true,
+              accessKeySecret: {
+                  name: mlpipeline-v3io,
+                  key: accesskey
+              },
+              secretKeySecret: {
+                  name: mlpipeline-v3io,
+                  key: secretkey
+              }
+          }
+      }
     }
 kind: ConfigMap
 metadata:
   name: workflow-controller-configmap
   namespace: <namespace>
+---
+apiVersion: v1
+data:
+  accesskey: <accesskeybase64>
+kind: Secret
+metadata:
+  name: v3io-webapi-secret
+  namespace: <namespace>
+type: Opaque
 ---
 apiVersion: v1
 data:
@@ -487,19 +496,6 @@ metadata:
   name: mlpipeline-minio-artifact
   namespace: <namespace>
 type: Opaque
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: minio-service
-  namespace: <namespace>
-spec:
-  ports:
-  - port: 9000
-    protocol: TCP
-    targetPort: 9000
-  selector:
-    app: minio
 ---
 apiVersion: v1
 kind: Service
@@ -543,44 +539,6 @@ spec:
   - port: 3306
   selector:
     app: mysql
----
-apiVersion: apps/v1beta1
-kind: Deployment
-metadata:
-  name: minio
-  namespace: <namespace>
-spec:
-  selector:
-    matchLabels:
-      app: minio
-  strategy:
-    type: Recreate
-  template:
-    metadata:
-      labels:
-        app: minio
-    spec:
-      containers:
-      - args:
-        - server
-        - /data
-        env:
-        - name: MINIO_ACCESS_KEY
-          value: minio
-        - name: MINIO_SECRET_KEY
-          value: minio123
-        image: minio/minio:RELEASE.2018-02-09T22-40-05Z
-        name: minio
-        ports:
-        - containerPort: 9000
-        volumeMounts:
-        - mountPath: /data
-          name: data
-          subPath: minio
-      volumes:
-      - name: data
-        persistentVolumeClaim:
-          claimName: minio-pvc
 ---
 apiVersion: apps/v1beta2
 kind: Deployment
@@ -662,7 +620,9 @@ spec:
           value: X-v3io-session-key
         - name: HTTP_AUTHORIZATION_DEFAULT_VALUE
           value: <accesskey>
-        image: quay.io/iguazio/ml-pipelines-frontend
+        - name: MINIO_V3IO
+          value: "1"
+        image: quay.io/iguazio/ml-pipelines-frontend-v3io
         imagePullPolicy: IfNotPresent
         name: ml-pipeline-ui
         ports:
@@ -710,15 +670,15 @@ spec:
       containers:
       - env:
         - name: OBJECTSTORECONFIG_ACCESSKEY
-          value: minio
+          value: <accesskey>
         - name: OBJECTSTORECONFIG_SECRETACCESSKEY
           value: minio123
         - name: OBJECTSTORECONFIG_BUCKETNAME
           value: mlpipeline
         - name: OBJECTSTORECONFIG_PORT
-          value: "9000"
+          value: "8081"
         - name: OBJECTSTORECONFIG_HOST
-          value: minio-service
+          value: v3io-webapi
         - name: POD_NAMESPACE
           valueFrom:
             fieldRef:
@@ -731,38 +691,201 @@ spec:
         - containerPort: 8887
       serviceAccountName: ml-pipeline
 ---
-apiVersion: apps/v1beta2
+# Source: mysql/templates/init-scripts-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  namespace: <namespace>
+  name: mysql-init-scripts
+  labels:
+    app: mysql-kf
+    chart: mysql-0.0.1
+    release: mysql-kf
+    heritage: Tiller
+data:
+  enable-root-remote-access.sql: |
+    -- Allow passwordless (insecure) access to root user from anywhere
+    GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;
+    GRANT PROXY ON ''@'' TO 'root'@'%' WITH GRANT OPTION;
+    FLUSH PRIVILEGES;
+
+---
+# Source: mysql/templates/mysql-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  namespace: <namespace>
+  name: mysql-kf
+  labels:
+    app: mysql-kf
+    chart: mysql-0.0.1
+    release: mysql-kf
+    heritage: Tiller
+data:
+
+  health_check.sh: |
+    mysqladmin status
+
+  init-v3io-mysql.sh: |
+    #!/usr/bin/env bash
+    set -e
+
+    echo "Current user -> $(whoami)"
+    LOCK_FILE=/var/lib/mysql/.init-complete
+    if [ -f $LOCK_FILE ]
+    then
+      echo "MySQL has already been initialized. Skipping..."
+    else
+      echo "Initializing MySQL..."
+
+      mysql_install_db --user=mysql --basedir=/usr --datadir=/tmp/mysql
+      # and then copy the init files into real working directory (on Fuse mount)
+      cp -R /tmp/mysql /var/lib/
+
+      touch $LOCK_FILE
+    fi
+
+  v3io-mysql.sh: |
+    #!/usr/bin/env bash
+    set -e
+
+    echo "Current user -> $(whoami)"
+
+    LOCK_FILE=/var/lib/mysql/.allow-remote-access-complete
+    if [ ! -f $LOCK_FILE ]
+    then
+      MYSQL_CONFIG=/etc/mysql/my.cnf
+      INIT_SCRIPT="/etc/config/mysql/init-scripts/enable-root-remote-access.sql"
+
+      # Call init script on startup
+      echo "Adding $INIT_SCRIPT to $MYSQL_CONFIG ..."
+      echo "" >> $MYSQL_CONFIG
+      echo "[mysqld]" >> $MYSQL_CONFIG
+      echo "init-file=$INIT_SCRIPT" >> $MYSQL_CONFIG
+
+      touch $LOCK_FILE
+    fi
+
+    echo "Starting MySQL ..."
+    # Note, "--user=root" flag allows running server as user root (default user)
+    mysqld --user=root
+
+---
+# Source: mysql/templates/mysql-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: <namespace>
+  name: mysql
+  labels:
+    app: mysql-kf
+    chart: mysql-0.0.1
+    release: mysql-kf
+    heritage: Tiller
+spec:
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
+      protocol: TCP
+  selector:
+    app: mysql-kf
+    release: mysql-kf
+
+---
+# Source: mysql/templates/mysql-deployment.yaml
+apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mysql
   namespace: <namespace>
+  name: mysql-kf
+  labels:
+    app: mysql-kf
+    chart: mysql-0.0.1
+    release: mysql-kf
+    heritage: Tiller
 spec:
   selector:
     matchLabels:
-      app: mysql
-  strategy:
-    type: Recreate
+      app: mysql-kf
+      release: mysql-kf
   template:
     metadata:
       labels:
-        app: mysql
+        app: mysql-kf
+        release: mysql-kf
     spec:
-      containers:
-      - env:
-        - name: MYSQL_ALLOW_EMPTY_PASSWORD
-          value: "true"
-        image: mysql:5.6
-        name: mysql
-        ports:
-        - containerPort: 3306
-          name: mysql
-        volumeMounts:
-        - mountPath: /var/lib/mysql
-          name: mysql-persistent-storage
       volumes:
-      - name: mysql-persistent-storage
-        persistentVolumeClaim:
-          claimName: mysql-pv-claim
+        - name: mysql-init-scripts
+          configMap:
+            name: mysql-init-scripts
+        - name: mysql-config
+          configMap:
+            name: mysql-kf
+        # Add MySQL data mount (Fuse)
+        - name: mysql-fuse
+          flexVolume:
+            driver: "v3io/fuse"
+            options:
+              container: users
+              subPath: /mlpipeline/mysql-kf
+              accessKey: <accesskey>
+      initContainers:
+        - name: init-mysql
+          image: "mysql:5.6"
+          imagePullPolicy: IfNotPresent
+          resources:
+            {}
+          env:
+            - name: MYSQL_ALLOW_EMPTY_PASSWORD
+              value: "true"
+          command:
+            - /bin/bash
+            - /etc/config/mysql/init-v3io-mysql.sh
+          securityContext:
+            runAsUser: 1001
+          volumeMounts:
+            - name: mysql-fuse
+              mountPath: "/var/lib/mysql"
+            - name: mysql-config
+              mountPath: /etc/config/mysql
+      containers:
+        - name: mysql-mysql
+          image: "mysql:5.6"
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "/etc/config/mysql/v3io-mysql.sh"]
+          ports:
+            - name: mysql
+              containerPort: 3306
+              protocol: TCP
+          livenessProbe:
+            exec:
+              command:
+              - /bin/bash
+              - /etc/config/mysql/health_check.sh
+            initialDelaySeconds: 10
+            failureThreshold: 3
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command:
+              - /bin/bash
+              - /etc/config/mysql/health_check.sh
+            initialDelaySeconds: 20
+            failureThreshold: 3
+            periodSeconds: 10
+          env:
+            - name: MYSQL_ALLOW_EMPTY_PASSWORD
+              value: "true"
+          volumeMounts:
+            - name: mysql-fuse
+              mountPath: "/var/lib/mysql"
+            - name: mysql-config
+              mountPath: /etc/config/mysql
+            - name: mysql-init-scripts
+              mountPath: /etc/config/mysql/init-scripts
+          resources:
+            {}
 ---
 apiVersion: extensions/v1beta1
 kind: Deployment
@@ -817,26 +940,3 @@ spec:
       serviceAccountName: argo
       terminationGracePeriodSeconds: 30
 ---
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: minio-pvc
-  namespace: <namespace>
-spec:
-  accessModes:
-  - ReadWriteOnce
-  resources:
-    requests:
-      storage: 20Gi
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: mysql-pv-claim
-  namespace: <namespace>
-spec:
-  accessModes:
-  - ReadWriteOnce
-  resources:
-    requests:
-      storage: 20Gi
